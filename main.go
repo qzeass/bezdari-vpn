@@ -743,7 +743,6 @@ func (a *App) tonPaymentWatcher() {
 		<-ticker.C
 	}
 }
-  
 func (a *App) scanChainPayments() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()

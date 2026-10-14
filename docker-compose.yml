@@ -1,0 +1,11 @@
+services:
+  bot:
+    build: .
+    container_name: pyaterochka-vpn-bot
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_PATH: /data/data.sqlite
+    volumes:
+      - ./data:/data
+    stop_grace_period: 30s
