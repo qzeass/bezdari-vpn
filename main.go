@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -27,11 +28,16 @@ type Config struct {
 	BotToken, AdminID, APIBase, APIKey, PlanID, PublicURL, TONWallet, TONAPIKey, USDTMaster, PaymentSecret, Support string
 	TONPrice7, TONPrice30, TONPrice90, USDTPrice7, USDTPrice30, USDTPrice90                                         string
 	TONAPIBase                                                                                                      string
+	RubPrice7, RubPrice30, RubPrice90, ReferralBonusPercent                                                         string
 }
 type App struct {
-	cfg    Config
-	db     *sql.DB
-	client *http.Client
+	cfg         Config
+	db          *sql.DB
+	client      *http.Client
+	rateMu      sync.RWMutex
+	tonRub      float64
+	usdtRub     float64
+	rateUpdated time.Time
 }
 type tgUpdate struct {
 	UpdateID    int            `json:"update_id"`
@@ -98,7 +104,7 @@ type partnerUser struct {
 
 func env(k string) string { return strings.TrimSpace(os.Getenv(k)) }
 func main() {
-	cfg := Config{BotToken: env("TELEGRAM_BOT_TOKEN"), AdminID: env("ADMIN_TELEGRAM_ID"), APIBase: strings.TrimRight(envDefault("VPN_API_BASE", "https://api.subkeyapi.com"), "/"), APIKey: env("VPN_API_KEY"), PlanID: env("VPN_PLAN_ID"), PublicURL: env("PUBLIC_URL"), TONWallet: env("TON_WALLET_ADDRESS"), TONAPIKey: env("TONAPI_KEY"), USDTMaster: env("USDT_JETTON_MASTER"), PaymentSecret: env("PAYMENT_SECRET"), Support: envDefault("SUPPORT_USERNAME", ""), TONPrice7: env("TON_PRICE_7_NANO"), TONPrice30: env("TON_PRICE_30_NANO"), TONPrice90: env("TON_PRICE_90_NANO"), USDTPrice7: env("USDT_PRICE_7_MICRO"), USDTPrice30: env("USDT_PRICE_30_MICRO"), USDTPrice90: env("USDT_PRICE_90_MICRO"), TONAPIBase: strings.TrimRight(envDefault("TONAPI_BASE", "https://tonapi.io"), "/")}
+	cfg := Config{BotToken: env("TELEGRAM_BOT_TOKEN"), AdminID: env("ADMIN_TELEGRAM_ID"), APIBase: strings.TrimRight(envDefault("VPN_API_BASE", "https://api.subkeyapi.com"), "/"), APIKey: env("VPN_API_KEY"), PlanID: env("VPN_PLAN_ID"), PublicURL: env("PUBLIC_URL"), TONWallet: env("TON_WALLET_ADDRESS"), TONAPIKey: env("TONAPI_KEY"), USDTMaster: env("USDT_JETTON_MASTER"), PaymentSecret: env("PAYMENT_SECRET"), Support: envDefault("SUPPORT_USERNAME", ""), TONPrice7: env("TON_PRICE_7_NANO"), TONPrice30: env("TON_PRICE_30_NANO"), TONPrice90: env("TON_PRICE_90_NANO"), USDTPrice7: env("USDT_PRICE_7_MICRO"), USDTPrice30: env("USDT_PRICE_30_MICRO"), USDTPrice90: env("USDT_PRICE_90_MICRO"), TONAPIBase: strings.TrimRight(envDefault("TONAPI_BASE", "https://tonapi.io"), "/"), RubPrice7: envDefault("PRICE_7_RUB", "49"), RubPrice30: envDefault("PRICE_30_RUB", "149"), RubPrice90: envDefault("PRICE_90_RUB", "349"), ReferralBonusPercent: envDefault("REFERRAL_BONUS_PERCENT", "10")}
 	if cfg.BotToken == "" || cfg.APIKey == "" || cfg.PlanID == "" {
 		log.Fatal("Set TELEGRAM_BOT_TOKEN, VPN_API_KEY and VPN_PLAN_ID in .env")
 	}
@@ -121,6 +127,7 @@ func main() {
 		go a.tonPaymentWatcher()
 	}
 	go a.fulfillmentWorker()
+	go a.exchangeRateWorker()
 	a.pollTelegram()
 }
 func envDefault(k, d string) string {
@@ -130,13 +137,19 @@ func envDefault(k, d string) string {
 	return d
 }
 func (a *App) initDB() error {
-	_, e := a.db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(tg_id INTEGER PRIMARY KEY, username TEXT, created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS ui_messages(chat_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,tg_id INTEGER NOT NULL,days INTEGER NOT NULL,method TEXT NOT NULL,status TEXT NOT NULL,expected_amount TEXT NOT NULL DEFAULT '',currency TEXT NOT NULL DEFAULT '',tx_hash TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,subscription_url TEXT NOT NULL DEFAULT '',expires_at TEXT NOT NULL DEFAULT '',partner_order_id TEXT NOT NULL DEFAULT ''); CREATE UNIQUE INDEX IF NOT EXISTS orders_tx ON orders(tx_hash) WHERE tx_hash<>''; CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY);`)
+	_, e := a.db.Exec(`PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS users(tg_id INTEGER PRIMARY KEY, username TEXT, created_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS ui_messages(chat_id INTEGER PRIMARY KEY, message_id INTEGER NOT NULL, updated_at INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS orders(id TEXT PRIMARY KEY,tg_id INTEGER NOT NULL,days INTEGER NOT NULL,method TEXT NOT NULL,status TEXT NOT NULL,expected_amount TEXT NOT NULL DEFAULT '',currency TEXT NOT NULL DEFAULT '',tx_hash TEXT NOT NULL DEFAULT '',created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,subscription_url TEXT NOT NULL DEFAULT '',expires_at TEXT NOT NULL DEFAULT '',partner_order_id TEXT NOT NULL DEFAULT ''); CREATE UNIQUE INDEX IF NOT EXISTS orders_tx ON orders(tx_hash) WHERE tx_hash<>''; CREATE TABLE IF NOT EXISTS processed_updates(update_id INTEGER PRIMARY KEY);
+ CREATE TABLE IF NOT EXISTS user_meta(tg_id INTEGER PRIMARY KEY, balance_rub INTEGER NOT NULL DEFAULT 0, blocked INTEGER NOT NULL DEFAULT 0, vpn_paused INTEGER NOT NULL DEFAULT 0, referrer_id INTEGER NOT NULL DEFAULT 0, referral_rewarded INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL DEFAULT 0);
+ CREATE TABLE IF NOT EXISTS required_channels(chat_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', added_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS admin_inputs(tg_id INTEGER PRIMARY KEY, action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+ CREATE TABLE IF NOT EXISTS app_settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+ CREATE TABLE IF NOT EXISTS exchange_rates(asset TEXT PRIMARY KEY, rub REAL NOT NULL, updated_at INTEGER NOT NULL);`)
 	if e != nil {
 		return e
 	}
 	// Backward-compatible migration for existing installs.
 	_, _ = a.db.Exec(`ALTER TABLE orders ADD COLUMN payment_memo TEXT NOT NULL DEFAULT ''`)
 	_, _ = a.db.Exec(`ALTER TABLE orders ADD COLUMN notified_at INTEGER NOT NULL DEFAULT 0`)
+	_, _ = a.db.Exec(`ALTER TABLE user_meta ADD COLUMN vpn_paused INTEGER NOT NULL DEFAULT 0`)
 	return nil
 }
 func (a *App) partner(path, method string, body any, key string, out any) error {
@@ -287,7 +300,9 @@ func inline(rows ...[]map[string]string) any { return map[string]any{"inline_key
 func (a *App) homeKeyboard(chat int64) any {
 	rows := [][]map[string]string{
 		{button("Купить доступ", "buy", "primary")},
-		{button("Мой VPN", "status", "success"), button("Поддержка", "help", "")},
+		{button("Мой VPN", "status", "success"), button("Тарифы", "buy", "")},
+		{button("Баланс", "balance", ""), button("Пригласить друга", "referral", "")},
+		{button("Поддержка", "help", "")},
 	}
 	if a.cfg.AdminID != "" && strconv.FormatInt(chat, 10) == a.cfg.AdminID {
 		rows = append(rows, []map[string]string{button("Администрирование", "admin", "")})
@@ -295,16 +310,44 @@ func (a *App) homeKeyboard(chat int64) any {
 	return inline(rows...)
 }
 func (a *App) home(chat int64) {
+	if !a.hasRequiredChannels(chat) {
+		a.showRequiredChannels(chat)
+		return
+	}
 	a.send(chat, "<b>впн от пятерочки</b>\n\nПриватный VPN-доступ без лишних настроек.\n\nВыбери действие.", a.homeKeyboard(chat))
 }
 func (a *App) handleMessage(m tgMessage) {
 	id := m.From.ID
 	_, _ = a.db.Exec(`INSERT INTO users(tg_id,username,created_at) VALUES(?,?,?) ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username`, id, m.From.Username, time.Now().Unix())
+	if m.Text != "" && strings.HasPrefix(m.Text, "/start") {
+		parts := strings.Fields(m.Text)
+		if len(parts) > 1 && strings.HasPrefix(parts[1], "ref_") {
+			refID, _ := strconv.ParseInt(strings.TrimPrefix(parts[1], "ref_"), 10, 64)
+			if refID > 0 && refID != id {
+				_, _ = a.db.Exec(`INSERT INTO user_meta(tg_id,created_at,referrer_id) VALUES(?,?,?) ON CONFLICT(tg_id) DO UPDATE SET referrer_id=CASE WHEN user_meta.referrer_id=0 THEN excluded.referrer_id ELSE user_meta.referrer_id END`, id, time.Now().Unix(), refID)
+			}
+		}
+	}
+	_, _ = a.db.Exec(`INSERT INTO user_meta(tg_id,created_at) VALUES(?,?) ON CONFLICT(tg_id) DO NOTHING`, id, time.Now().Unix())
+	if m.Text != "" && strconv.FormatInt(id, 10) == a.cfg.AdminID {
+		var action, payload string
+		if a.db.QueryRow(`SELECT action,payload FROM admin_inputs WHERE tg_id=?`, id).Scan(&action, &payload) == nil {
+			_ = a.tg("deleteMessage", map[string]any{"chat_id": m.Chat.ID, "message_id": m.MessageID}, nil)
+			a.handleAdminInput(m.Chat.ID, id, action, payload, m.Text)
+			return
+		}
+	}
 	if m.SuccessfulPayment != nil {
 		// Telegram posts a service message for successful payments. Remove it so the
 		// conversation remains visually centred around the single editable UI message.
 		_ = a.tg("deleteMessage", map[string]any{"chat_id": m.Chat.ID, "message_id": m.MessageID}, nil)
 		a.handleStars(m)
+		return
+	}
+	var blocked int
+	_ = a.db.QueryRow(`SELECT blocked FROM user_meta WHERE tg_id=?`, id).Scan(&blocked)
+	if blocked == 1 && strconv.FormatInt(id, 10) != a.cfg.AdminID {
+		_ = a.tg("deleteMessage", map[string]any{"chat_id": m.Chat.ID, "message_id": m.MessageID}, nil)
 		return
 	}
 	// Commands are intentionally not part of the UX. /start is only the entry point;
@@ -321,6 +364,19 @@ func (a *App) handleCallback(c tgCallback) {
 		return
 	}
 	chat, uid := c.Message.Chat.ID, c.From.ID
+	if !a.isAdmin(uid) {
+		var blocked int
+		_ = a.db.QueryRow(`SELECT blocked FROM user_meta WHERE tg_id=?`, uid).Scan(&blocked)
+		if blocked == 1 {
+			_ = a.tg("answerCallbackQuery", map[string]any{"callback_query_id": c.ID, "text": "Доступ к боту отключён."}, nil)
+			return
+		}
+	}
+	if !a.isAdmin(uid) && c.Data != "channels:check" && !strings.HasPrefix(c.Data, "admin") && !a.hasRequiredChannels(uid) {
+		_ = a.tg("answerCallbackQuery", map[string]any{"callback_query_id": c.ID, "text": "Сначала подпишись на обязательные каналы."}, nil)
+		a.showRequiredChannels(chat)
+		return
+	}
 	_ = a.tg("answerCallbackQuery", map[string]any{"callback_query_id": c.ID}, nil)
 	switch {
 	case c.Data == "home":
@@ -333,6 +389,61 @@ func (a *App) handleCallback(c tgCallback) {
 		a.showHelp(chat)
 	case c.Data == "admin":
 		a.showAdmin(chat, uid)
+	case c.Data == "admin:users":
+		a.showAdminUsers(chat, uid, 0)
+	case strings.HasPrefix(c.Data, "admin:users:"):
+		page, _ := strconv.Atoi(strings.TrimPrefix(c.Data, "admin:users:"))
+		a.showAdminUsers(chat, uid, page)
+	case strings.HasPrefix(c.Data, "admin:user:"):
+		target, _ := strconv.ParseInt(strings.TrimPrefix(c.Data, "admin:user:"), 10, 64)
+		a.showAdminUser(chat, uid, target)
+	case strings.HasPrefix(c.Data, "admin:bal:"):
+		parts := strings.Split(c.Data, ":")
+		if len(parts) == 5 {
+			target, _ := strconv.ParseInt(parts[3], 10, 64)
+			delta, _ := strconv.ParseInt(parts[4], 10, 64)
+			if parts[2] == "sub" {
+				delta = -delta
+			}
+			a.adjustBalance(chat, uid, target, delta)
+		}
+	case strings.HasPrefix(c.Data, "admin:block:"):
+		target, _ := strconv.ParseInt(strings.TrimPrefix(c.Data, "admin:block:"), 10, 64)
+		a.toggleBlock(chat, uid, target)
+	case strings.HasPrefix(c.Data, "admin:vpn:disable:"):
+		target, _ := strconv.ParseInt(strings.TrimPrefix(c.Data, "admin:vpn:disable:"), 10, 64)
+		a.setVPNPaused(chat, uid, target, true)
+	case strings.HasPrefix(c.Data, "admin:vpn:enable:"):
+		target, _ := strconv.ParseInt(strings.TrimPrefix(c.Data, "admin:vpn:enable:"), 10, 64)
+		a.setVPNPaused(chat, uid, target, false)
+	case c.Data == "admin:channels":
+		a.showAdminChannels(chat, uid)
+	case c.Data == "admin:channel:add":
+		a.askAdminInput(chat, uid, "channel_add", "")
+	case strings.HasPrefix(c.Data, "admin:channel:del:"):
+		a.deleteChannel(chat, uid, strings.TrimPrefix(c.Data, "admin:channel:del:"))
+	case c.Data == "admin:rates":
+		a.showRates(chat, uid)
+	case c.Data == "admin:prices":
+		a.showAdminPrices(chat, uid)
+	case c.Data == "admin:orders":
+		a.showAdminOrders(chat, uid)
+	case strings.HasPrefix(c.Data, "admin:price:set:"):
+		days, _ := strconv.Atoi(strings.TrimPrefix(c.Data, "admin:price:set:"))
+		if validDays(days) {
+			a.askAdminInput(chat, uid, "price_set", strconv.Itoa(days))
+		}
+	case c.Data == "referral":
+		a.showReferral(chat, uid)
+	case c.Data == "balance":
+		a.showBalance(chat, uid)
+	case strings.HasPrefix(c.Data, "paybalance:"):
+		days, _ := strconv.Atoi(strings.TrimPrefix(c.Data, "paybalance:"))
+		if validDays(days) {
+			a.payWithBalance(chat, uid, days)
+		}
+	case c.Data == "channels:check":
+		a.checkRequiredChannels(chat, uid)
 	case strings.HasPrefix(c.Data, "stars:"):
 		days, _ := strconv.Atoi(strings.TrimPrefix(c.Data, "stars:"))
 		if !validDays(days) {
@@ -358,9 +469,14 @@ func (a *App) handleCallback(c tgCallback) {
 }
 func validDays(d int) bool { return d == 7 || d == 30 || d == 90 }
 func (a *App) showPaymentMethods(chat int64, days int) {
-	rows := [][]map[string]string{{button("Telegram Stars · "+strconv.Itoa(starsPrice(days))+" ⭐", fmt.Sprintf("stars:%d", days), "primary")}}
+	rows := [][]map[string]string{{button("Telegram Stars · "+strconv.Itoa(starsPrice(days)), fmt.Sprintf("stars:%d", days), "primary")}}
 	if a.cryptoEnabled() {
 		rows = append(rows, []map[string]string{button("TON", fmt.Sprintf("crypto:TON:%d", days), ""), button("USDT · TON", fmt.Sprintf("crypto:USDT:%d", days), "")})
+	}
+	var balance int64
+	_ = a.db.QueryRow(`SELECT balance_rub FROM user_meta WHERE tg_id=?`, chat).Scan(&balance)
+	if balance >= a.priceRub(days) {
+		rows = append(rows, []map[string]string{button(fmt.Sprintf("Оплатить с баланса · %d ₽", a.priceRub(days)), fmt.Sprintf("paybalance:%d", days), "success")})
 	}
 	rows = append(rows, []map[string]string{button("Назад", "buy", ""), button("Главная", "home", "")})
 	a.send(chat, fmt.Sprintf("<b>Оплата</b>\n\nVPN-доступ на <b>%d дней</b>\n\nВыбери способ оплаты.", days), inline(rows...))
@@ -370,7 +486,7 @@ func (a *App) showHelp(chat int64) {
 	text := "<b>Поддержка</b>\n\nЕсли возникла проблема с оплатой или подключением, напиши нам."
 	rows := [][]map[string]string{{button("Назад", "home", "")}}
 	if support != "" {
-		rows = append([]map[string]string{{urlButton("Написать в поддержку", "https://t.me/"+url.PathEscape(support), "primary")}}, rows...)
+		rows = append([][]map[string]string{{urlButton("Написать в поддержку", "https://t.me/"+url.PathEscape(support), "primary")}}, rows...)
 	}
 	a.send(chat, text, inline(rows...))
 }
@@ -384,7 +500,7 @@ func (a *App) showAdmin(chat, uid int64) {
 	_ = a.db.QueryRow(`SELECT count(*) FROM orders WHERE status IN ('paid','active')`).Scan(&paid)
 	_ = a.db.QueryRow(`SELECT count(*) FROM orders WHERE status='active'`).Scan(&active)
 	_ = a.db.QueryRow(`SELECT count(*) FROM orders WHERE status='pending'`).Scan(&pending)
-	a.send(chat, fmt.Sprintf("<b>Администрирование</b>\n\nПользователи: <b>%d</b>\nОплачено заказов: <b>%d</b>\nАктивные подписки: <b>%d</b>\nОжидают оплаты: <b>%d</b>", users, paid, active, pending), inline([]map[string]string{button("Обновить", "admin", ""), button("Главная", "home", "")}))
+	a.send(chat, fmt.Sprintf("<b>Администрирование</b>\n\nПользователи: <b>%d</b>\nОплачено заказов: <b>%d</b>\nАктивные подписки: <b>%d</b>\nОжидают оплаты: <b>%d</b>", users, paid, active, pending), inline([]map[string]string{button("Пользователи", "admin:users", "primary")}, []map[string]string{button("Обязательная подписка", "admin:channels", "")}, []map[string]string{button("Курсы валют", "admin:rates", "")}, []map[string]string{button("Цены тарифов", "admin:prices", "")}, []map[string]string{button("Заказы", "admin:orders", "")}, []map[string]string{button("Обновить", "admin", ""), button("Главная", "home", "")}))
 }
 
 func (a *App) showBuy(chat int64) {
@@ -403,8 +519,18 @@ func (a *App) showStatus(chat int64, id int64) {
 		a.send(chat, "<b>Мой VPN</b>\n\nАктивная подписка не найдена. Выбери тариф, чтобы подключиться.", inline([]map[string]string{button("Купить доступ", "buy", "primary")}, []map[string]string{button("Главная", "home", "")}))
 		return
 	}
-	text := "<b>Мой VPN</b>\n\nСтатус: <b>активен</b>\nДействует до: <b>" + html.EscapeString(exp) + "</b>\n\nСсылка подписки хранится конфиденциально. Не пересылай её другим."
-	rows := [][]map[string]string{{urlButton("Открыть подписку", subURL, "success")}, {button("Обновить", "status", ""), button("Продлить", "buy", "primary")}, {button("Главная", "home", "")}}
+	var paused int
+	_ = a.db.QueryRow(`SELECT vpn_paused FROM user_meta WHERE tg_id=?`, id).Scan(&paused)
+	state := "активен"
+	if paused == 1 {
+		state = "приостановлен администратором"
+	}
+	text := "<b>Мой VPN</b>\n\nСтатус: <b>" + state + "</b>\nДействует до: <b>" + html.EscapeString(exp) + "</b>\n\nСсылка подписки хранится конфиденциально. Не пересылай её другим."
+	rows := [][]map[string]string{}
+	if paused == 0 {
+		rows = append(rows, []map[string]string{urlButton("Открыть подписку", subURL, "success")})
+	}
+	rows = append(rows, []map[string]string{button("Обновить", "status", ""), button("Продлить", "buy", "primary")}, []map[string]string{button("Главная", "home", "")})
 	a.send(chat, text, inline(rows...))
 }
 func (a *App) showOrderStatus(chat, uid int64, orderID string) {
@@ -493,7 +619,11 @@ func starsPrice(days int) int {
 	}
 }
 func (a *App) cryptoEnabled() bool {
-	return a.cfg.TONWallet != "" && a.cfg.TONAPIKey != "" && a.cfg.TONPrice7 != "" && a.cfg.TONPrice30 != "" && a.cfg.TONPrice90 != "" && a.cfg.USDTMaster != "" && a.cfg.USDTPrice7 != "" && a.cfg.USDTPrice30 != "" && a.cfg.USDTPrice90 != ""
+	if a.cfg.TONWallet == "" || a.cfg.TONAPIKey == "" || a.cfg.USDTMaster == "" {
+		return false
+	}
+	ton, usdt, updated := a.rates()
+	return ton > 0 && usdt > 0 && !updated.IsZero() && time.Since(updated) < 2*time.Hour
 }
 
 func cryptoPrice(asset string, days int, cfg Config) string {
@@ -538,7 +668,7 @@ func (a *App) createCryptoOrder(chat int64, uid int64, asset string, days int) {
 		a.send(chat, "Криптооплата пока не настроена. Выбери Telegram Stars.", inline([]map[string]string{button("Купить через Stars", "buy", "primary")}, []map[string]string{button("Главная", "home", "")}))
 		return
 	}
-	amount := cryptoPrice(asset, days, a.cfg)
+	amount := a.dynamicCryptoPrice(asset, days)
 	if amount == "" || (asset != "TON" && asset != "USDT") {
 		a.send(chat, "Этот способ оплаты сейчас недоступен. Выбери другой способ.", inline([]map[string]string{button("Назад", "buy", "")}, []map[string]string{button("Главная", "home", "")}))
 		return
@@ -551,11 +681,8 @@ func (a *App) createCryptoOrder(chat int64, uid int64, asset string, days int) {
 		a.send(chat, "Не удалось создать заказ. Попробуй ещё раз.", inline([]map[string]string{button("Повторить", "buy", "primary")}, []map[string]string{button("Главная", "home", "")}))
 		return
 	}
-	unit := "nanoTON"
-	if asset == "USDT" {
-		unit = "микро-USDT (6 знаков после запятой)"
-	}
-	message := fmt.Sprintf("<b>Оплата %s</b>\n\nVPN-доступ: <b>%d дней</b>\nСеть: <b>TON</b>\nАктив: <b>%s</b>\nСумма: <code>%s</code> (%s)\n\nКошелёк для перевода:\n<code>%s</code>\n\nКомментарий к переводу:\n<code>%s</code>\n\nПереведи точную сумму и обязательно укажи комментарий. Заказ действует 30 минут. Доступ появится после подтверждения транзакции.", asset, days, asset, html.EscapeString(amount), unit, html.EscapeString(a.cfg.TONWallet), html.EscapeString(memo))
+	displayAmount := formatCryptoAmount(asset, amount)
+	message := fmt.Sprintf("<b>Оплата %s</b>\n\nVPN-доступ: <b>%d дней</b>\nСеть: <b>TON</b>\nАктив: <b>%s</b>\nСумма: <code>%s %s</code>\n\nКошелёк для перевода:\n<code>%s</code>\n\nКомментарий к переводу:\n<code>%s</code>\n\nПереведи точную сумму и обязательно укажи комментарий. Заказ действует 30 минут. Доступ появится после подтверждения транзакции.", asset, days, asset, html.EscapeString(displayAmount), asset, html.EscapeString(a.cfg.TONWallet), html.EscapeString(memo))
 	a.send(chat, message, inline([]map[string]string{button("Проверить оплату", "check:"+id, "primary")}, []map[string]string{button("Назад", "buy", ""), button("Главная", "home", "")}))
 }
 
@@ -590,6 +717,7 @@ func (a *App) fulfill(orderID string, uid int64, days int, chat int64) {
 	if e != nil {
 		log.Printf("persist fulfillment: %v", e)
 	}
+	a.awardReferral(uid, days)
 	a.send(chat, "<b>VPN готов</b>\n\nОплата подтверждена. Доступ активирован.\n\nСсылка подписки:\n<code>"+html.EscapeString(current.SubscriptionURL)+"</code>\n\nДобавь ссылку в Happ или другое приложение с поддержкой подписок. Не пересылай её другим.", inline([]map[string]string{urlButton("Открыть подписку", current.SubscriptionURL, "success")}, []map[string]string{button("Мой VPN", "status", ""), button("Главная", "home", "")}))
 }
 
@@ -819,4 +947,11 @@ func verifyHMAC(secret, timestamp string, body []byte, sig string) bool {
 	mac.Write(body)
 	want := hex.EncodeToString(mac.Sum(nil))
 	return hmac.Equal([]byte(want), []byte(sig))
+}
+
+func max64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

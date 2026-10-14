@@ -38,3 +38,17 @@ func TestParseUSDTTransferRequiresJettonAction(t *testing.T) {
 		t.Fatalf("USDT event accepted as TON: %q", m)
 	}
 }
+
+func TestFormatCryptoAmount(t *testing.T) {
+	cases := []struct{ asset, smallest, want string }{
+		{"TON", "150000000", "0.15"},
+		{"TON", "1000000000", "1"},
+		{"USDT", "1500000", "1.5"},
+		{"USDT", "1000000", "1"},
+	}
+	for _, tc := range cases {
+		if got := formatCryptoAmount(tc.asset, tc.smallest); got != tc.want {
+			t.Errorf("formatCryptoAmount(%s,%s)=%s want %s", tc.asset, tc.smallest, got, tc.want)
+		}
+	}
+}
